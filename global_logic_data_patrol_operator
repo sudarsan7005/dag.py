@@ -1,0 +1,55 @@
+import logging
+
+from airflow.models.baseoperator import BaseOperator
+from airflow.exceptions import AirflowSkipException
+
+
+class GlobalLogicDataPatrolOperator(BaseOperator):
+    def __init__(
+            self,
+            config: any,
+            **kwargs) -> None:
+        self.config = config
+        self.data_source = self.config["requested_datasource"]
+        super().__init__(**kwargs)
+
+    def execute(self, context):
+        # Get executions list from XComs from previous task
+        ti = context['ti']
+        executions = ti.xcom_pull(task_ids=f"trigger_{self.data_source}_dag05.dynamic_create_view", key='return_value')
+
+        if not executions:
+            logging.info("Data patrol task not needed. Skipping task...")
+            raise AirflowSkipException()
+        else:
+            # Imported here to facilitate unit testing
+            from data_patrol import data_patrol_access_logic
+
+            # If the country is not specified, execute datapatrol region-wise, once per unique component
+            # ti is required to get xcom_pull in data_patrol_access_logic. This change is part of threshold check at data access level.
+            if self.config["requested_country"] == "":
+                unique_components = self.__get_unique_components(executions)
+                for unique_component in unique_components:
+                    logging.info(f'Executing data patrol for: {self.config["requested_datasource"]} {unique_component}. Region: {self.config["requested_region"]}')
+                    data_patrol_access_logic(
+                        project_config=self.config,
+                        component=unique_component,
+                        task_id=self.task_id,
+                        ti=ti
+                    )
+            # If the country is specified, execute datapatrol country-wise
+            else:
+                for execution in executions:
+                    logging.info(f"Executing data patrol for: {execution}")
+                    data_patrol_access_logic(
+                        project_config=self.config,
+                        component=execution["component"],
+                        task_id=self.task_id,
+                        ti=ti
+                    )
+    
+    def __get_unique_components(self, executions: list) -> set:
+        components = set()
+        for execution in executions:
+            components.add(execution["component"])
+        return components
