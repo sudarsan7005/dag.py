@@ -1,0 +1,656 @@
+import logging
+import traceback
+import re
+import json
+import time
+import sys
+import os
+from pathlib import Path
+from datetime import datetime, timedelta
+
+from google.cloud import bigquery, storage
+from google.api_core.exceptions import Forbidden, BadRequest, NotFound, GoogleAPIError
+from google.auth.exceptions import DefaultCredentialsError
+from airflow.models.baseoperator import BaseOperator
+from tabulate import tabulate
+import pandas as pd
+
+# Add the parent directory to sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from dag_utils import getRequestedDate
+from data_patrol import data_patrol_send
+from custom_operators.global_logic_template_operator import GlobalLogicTemplateOperator
+class GlobalGenerateFileOperator (BaseOperator):
+
+    def __init__(
+            self,
+            config: any,
+            **kwargs) -> None:
+        self.config = config
+        self.country = self.config["requested_country"].upper()
+        self.region = self.config["requested_region"]
+        self.data_source = self.config["requested_datasource"]
+        self.requested_date = self.config["requested_date"]
+        self.component = self.config["requested_datasource_component"]
+        self.datalake_mocked_flag = self.config["datalake_mocked_flag"]
+        self.dataset = self.config["insights"]["dataset"]
+        self.environment = self.config["release_environment"]
+        super().__init__(**kwargs)
+
+    def execute(self, context):
+        logging.info('Executing the generate file operator')
+        self.__check_parameters()
+        self.bq_client = bigquery.Client() #Perhaps it can be removed
+        timestamp_file = datetime.now()
+        configuration_data_results = self.__get_global_transformation_file_configuration_data()
+        
+        row_list = []
+        if configuration_data_results.total_rows > 0 :
+            for row in configuration_data_results:
+                row_dict = {}
+                for k, v in row.items():
+                    row_dict[k] = v
+                row_dict['TimestampFile'] = timestamp_file.strftime('%Y%m%d%H%M%S%f')[:14]
+                timestamp_file += timedelta(seconds=1)
+                row_list.append(row_dict)
+        else:
+            logging.warning('No data found for the given parameters. So not generating any files')
+        
+        # xcom_push done in threshold_check.py, this is to remove records from row_list which exceeded threshold 
+        ti = context['ti']
+        xcom_taskid = f'trigger_{self.data_source}_dag02.threshold_check'
+        xcom_data = ti.xcom_pull(task_ids=xcom_taskid, key="data_access_threshold_check")
+        if xcom_data:    
+            if self.config["dp_threshold_override_flag"].upper()!='TRUE':
+                row_list_df = pd.DataFrame(row_list)
+                global_logic_operator = GlobalLogicTemplateOperator(task_id=self.task_id,config=self.config)           
+                final_row_list = global_logic_operator.filter_exceeding_threshold_records(row_list_df ,context)
+                row_list = []
+                row_list = final_row_list.to_dict(orient="records")
+                logging.info(tabulate(final_row_list, headers='keys', tablefmt='psql'))
+        return row_list
+
+    def __check_parameters(self):
+        logging.info('__check_parameters method')
+
+        logging.info(f'[Datasource] - {self.data_source}')
+        logging.info(f'[RequestedDate] - {self.requested_date}')
+        logging.info(f'[Region] - {self.region}')
+        logging.info(f'[Country] - {self.country}')
+        logging.info(f'[Component] - {self.component}')
+
+        if not all ([self.region, self.data_source, self.requested_date]):
+            logging.error(traceback.format_exc())
+            raise ValueError('Some of the required values were not sent. Region: ', self.region, ' DataSource: ', self.data_source, ' Requested Date: ', self.requested_date)
+
+        if not self.country:
+            logging.warning('Country is empty.')
+        else:
+            logging.info(f'Country is not empty. Value is: {self.country}')
+
+        if not self.component:
+            logging.warning('Component is empty.')
+        else:
+            logging.info(f'Component is not empty. Value is: {self.component}')
+
+    def __get_global_transformation_file_configuration_data(self) -> bigquery.table.RowIterator:
+        logging.info('__get_global_transformation_file_configuration_data method')
+
+        sql_path = Path(__file__).parent / "../../../dag_06_files/dml/global/global_transformation_file_creation_query.sql"
+
+        # Allow comma separated countries execution
+        comma_sep_countries = ''
+        if self.country:
+            countries = [f'"{country.strip().upper()}"' for country in self.country.split(',')]
+            comma_sep_countries = ','.join(countries)
+
+        country_info = ""
+        if comma_sep_countries:
+            country_info += f" - countries: {comma_sep_countries}"
+
+        component_info = ""
+        if self.component:
+            component_info = f" - component: {self.component}"
+
+        logging.info(f"The query will fetch data for all the processes for the datasource: {self.data_source} - region: {self.region}{country_info}{component_info}")
+
+        try:
+            with open(sql_path, 'r') as sqlSentence:
+                sql_query = sqlSentence.read()
+        except FileNotFoundError as e:
+            logging.error(traceback.format_exc())
+            raise FileNotFoundError(f"SQL file not found: {e}")
+        except IOError as e:
+            logging.error(traceback.format_exc())
+            raise IOError(f"Error reading SQL file: {e}")
+        
+        try:
+            sql_query = sql_query.replace(r'{requested_country}', comma_sep_countries)
+            sql_query = sql_query.replace(r'{requested_region}', self.region)
+            sql_query = sql_query.replace(r'{requested_datasource}', self.data_source)
+            sql_query = sql_query.replace(r'{requested_date}', self.requested_date)
+            sql_query = sql_query.replace(r'{requested_datasource_component}', self.component)
+            sql_query = sql_query.replace(r'{datalake_mocked_flag}', self.datalake_mocked_flag)
+        except AttributeError as e:
+            logging.error(traceback.format_exc())
+            raise AttributeError(f"Error replacing variables in SQL query: {e}")
+        except TypeError as e:
+            logging.error(traceback.format_exc())
+            raise TypeError(f"Error replacing variables in SQL query: {e}")
+
+        sql_content = self.__replace_vars(sql_query)
+        #print(f'[Query to be executed] {sql_content}')
+
+        return self.__execute_query(sql_content)
+
+    def __replace_vars(self, sql: str) -> str:
+        pattern = re.compile(r"{[A-Za-z0-9._]+}")
+        matches = pattern.findall(sql)
+        for var in matches:
+            keys = var.strip(r'{}').split('.')
+            try:
+                value = self.__get_value_from_keys(self.config, keys)
+                sql = sql.replace(var, value)
+            except KeyError as e:
+                logging.error(traceback.format_exc())
+                raise KeyError(f"Error replacing variable {var} in SQL query: {e}")
+            except Exception as e:
+                logging.error(traceback.format_exc())
+                raise Exception(f"Unexpected error when processing {var}: {e}")
+
+        return sql
+
+    def __get_value_from_keys(self, data: str, keys: list) -> str:
+        current_data = data
+        for key in keys:
+            if key in current_data:
+                current_data = current_data[key]
+            else:
+                # print(f"The key '{key}' does not exists in projectlist.json")
+                return None
+
+        if '{' in current_data:
+            # print(current_data)
+            return self.__replace_vars(current_data)
+        else:
+            # print(f"Value found for keys {keys}':", current_data)
+            return current_data
+
+    def generate_file(self, **kwargs) -> None:
+        logging.info("__generate_file method")
+
+        initial_message = f'<<< Processing file creation for: {kwargs["Region"]} - {kwargs["Country"]} - {kwargs["DataSource"]}'
+        if kwargs["FileName"]:
+            initial_message += f' - {kwargs["FileName"]} >>>'
+        else:
+            initial_message += f' - {kwargs["Component"]} >>>'
+        logging.info(initial_message)
+        
+        self.storage_client = storage.Client()
+        self.bq_client = bigquery.Client()
+        component = kwargs["Component"]
+        filename = kwargs["FileName"]
+        layout_path_list = kwargs["LayoutPath"].split(',') #To get the layoutpath list from comma seperated layoutpaths from payload
+        order_by_column = kwargs["OrderByColumn"]
+        output_file_name = kwargs["OutputFileName"]
+        file_name_function = kwargs["GetFileNameFunction"]
+        data_patrol_enabled = kwargs["DataPatrolEnabled"]
+        vendor = kwargs["Vendor"]
+        output_file_extension = kwargs["OutputFileExtension"]
+        timestamp_file = kwargs["TimestampFile"]
+        process_output_bucket = self.config["common"]["gcs_bucket_bq_output"]
+
+        self.date_to_execute = getRequestedDate(self.config, self.data_source)
+        self.country = kwargs["Country"]
+        country_key = self.__get_countryKey()
+        month = self.__get_month()
+        environment = self.__get_environment()
+        output_view_full_names=''
+        output_view_full_names_list=[]
+        output_view_name_list=kwargs["OutputViewName"].split(',') #To get the OutputViewName list from comma seperated OutputViewNames from payload
+        file_name = self.__get_file_name(output_file_name, file_name_function, country_key, environment, timestamp_file, month, filename, output_file_extension)
+        csv_file_name = file_name if file_name.endswith('.csv') else file_name.split('.')[0] + '.csv'
+        file_content=''
+        #For loop to generate the file from the data of the multiple outputviews in the respective layout format
+        if len(output_view_name_list) == len(layout_path_list):
+            for temp_file in range(0,len(output_view_name_list)):
+                # OutputViewName values are keys from projeclist.json, needs to be replaced
+                output_view_name = self.__replace_vars(output_view_name_list[temp_file])
+                output_view_full_name = output_view_name + "_" + self.date_to_execute.replace("-", "_")
+                output_view_full_names_list.append(output_view_name)
+                logging.info(f'[output_view_full_name] {output_view_full_name}')
+                logging.info(f'[output_view_full_name] {output_view_full_name} mapped to [Layoutpath] {layout_path_list[temp_file]}')
+                output_view_data = self.__get_data_from_output_view(output_view_full_name, order_by_column)
+                logging.info(f'[OutputViewData] {output_view_data}')
+
+                if not output_view_data:
+                     logging.warning('No data found in the output view')
+                
+                layout_format = self.__get_layout_format(layout_path_list[temp_file])
+                logging.info(f'[LayoutFormat] {layout_format}')
+
+                body_data = self.__get_body_data(output_view_data, layout_format["Body"])
+                body_content='\n'.join(body_data)
+                file_content = '\n'.join([body_content,file_content])
+                logging.info(f'[FileContent] \n{file_content}')
+            output_view_full_names=','.join(output_view_full_names_list)
+            temp_folder_full_path = kwargs["TempFolder"] + self.config["out_folder_name"].strip().replace('_','') + csv_file_name
+            logging.info(f'[TempFolderFullPath] {temp_folder_full_path}')
+
+            self.__upload_file_to_bucket(process_output_bucket, temp_folder_full_path, file_content)
+            logging.info(f'Temp file uploaded successfully to: {temp_folder_full_path}')
+            logging.info(f'[output_view_full_names] {output_view_full_names}')
+
+            feature_flag_value = str(self.config["feature_flags"].get(kwargs["SkipFileFeatureFlag"], False)).upper()
+            logging.info(f'SkipFileFeatureFlag value: {feature_flag_value}')
+            file_skipped = False
+            if feature_flag_value == 'TRUE':
+                destination_folder = kwargs["SkippedFolder"]
+                file_skipped = True
+            else:
+                destination_folder = kwargs["SuccessFolder"]
+            logging.info('The output file will be stored in the following folder: {}'.format(destination_folder + self.config["out_folder_name"].strip().replace('_','')))
+
+            # Return row data to data patrol operator if it applies
+            threshold_status = ''
+            dp_threshold_override_flag = ''
+
+            dp_destination_full_path = destination_folder + self.config["out_folder_name"].strip().replace('_','') + csv_file_name
+
+            if data_patrol_enabled:
+                logging.info(f'<<< Executing data patrol send for: {kwargs["Region"]} - {kwargs["Country"]} - {kwargs["DataSource"]} - {kwargs["Component"]} >>>')
+                file_object = file_name.split('.')[0]
+
+                dp_dict = {
+                    "project_config": self.config,
+                    "task_id": self.task_id,
+                    "country_key": country_key,
+                    "data_source": self.data_source,
+                    "source_object": file_object,
+                    "source_path": kwargs["TempFolder"],
+                    "destination_object": file_object,
+                    "destination_path": destination_folder,
+                    "vendor": vendor,
+                    "region": self.region.lower(),
+                    "component": component,
+                    "output_view_name": output_view_full_names,
+                    "doc_format": output_file_extension.replace(".", ""),
+                    "timestamp": timestamp_file
+                }
+                threshold_status, dp_threshold_override_flag = self.__execute_data_patrol_send(dp_dict)
+            else:
+                logging.warning('Data patrol is not enabled and will not be executed')
+                self.__copy_file_to_another_folder(process_output_bucket, temp_folder_full_path, dp_destination_full_path)
+
+            if data_patrol_enabled and (threshold_status == 'Failure' and dp_threshold_override_flag.upper() == 'FALSE'):
+                failed_full_path = kwargs["FailedFolder"] + self.config["out_folder_name"].strip().replace('_','') + csv_file_name
+                logging.warning(f'Data patrol threshold failure and dp_threshold_override_flag is FALSE, so the file without format will be moved to the following failed folder: {failed_full_path}')
+                self.__copy_file_to_another_folder(process_output_bucket, dp_destination_full_path, failed_full_path, True)
+            else: 
+                logging.info(f'<<< Executing the creation of the file with format for: {kwargs["Region"]} - {kwargs["Country"]} - {kwargs["DataSource"]} - {kwargs["Component"]} >>>')
+                header_data = self.__get_header_data(layout_format["Headers"], country_key, environment, timestamp_file, month, filename)
+                footer_layout = layout_format["Footers"][0]["Value"] if layout_format.get("Footers") else None
+
+                self.__create_file_with_format(header_data, process_output_bucket, dp_destination_full_path, footer_layout)
+                logging.info(f'File updated successfully with format in: {dp_destination_full_path}')
+
+                if output_file_extension.upper() == ".SAP":
+                    self.__rename_blob_with_sap_extension(process_output_bucket, dp_destination_full_path)
+
+                if not file_skipped:
+                    success_full_path = kwargs["SuccessFolder"] + self.config["out_folder_name"].strip().replace('_','') + file_name
+                    unprocessed_full_path = kwargs["DestinationFolder"] + self.config["out_folder_name"].strip().replace('_','') + file_name
+                    self.__copy_file_to_another_folder(process_output_bucket, success_full_path, unprocessed_full_path)
+
+            return None
+    
+    def __create_file_with_format(self, header_data:str, bucket_name:str, destination_full_path:str, footer_layout) -> None:
+        logging.info("__create_file_with_format method")
+
+        dest_file_content = self.__read_file_from_gcs(bucket_name, destination_full_path)
+
+        dest_file_lines = dest_file_content.split('\n')
+        if dest_file_lines and dest_file_lines[-1].strip() == '':
+            dest_file_lines = dest_file_lines[:-1]  # Remove the last element because it's an empty string
+
+        footer_data = ''
+
+        dest_file_rows_count = len(dest_file_lines)
+        if footer_layout:
+            footer_data = self.__get_footer_data(footer_layout, dest_file_rows_count)
+
+        file_content = header_data
+        if(dest_file_rows_count > 0):
+            file_content += '\n' + '\n'.join(dest_file_lines)
+
+        if footer_data:
+            file_content += '\n' + footer_data
+
+        self.__upload_file_to_bucket(bucket_name, destination_full_path, file_content)
+
+        return None
+
+    def __get_header_data(self, header_section:json, country_key:str, environment:str, timestamp_file:str, month:str, filename:str) -> str:
+        logging.info("__get_header_data method")
+
+        if(header_section["IsFixed"]):
+            return '\n'.join(header_section["Values"])
+        else:
+            return  self.__get_adp_header_columns(header_section["HeaderFunction"], country_key, environment, timestamp_file, month, filename)
+            
+    def __get_body_data(self, output_view_data:json, layout_format_body:list) -> list:
+        logging.info("__get_body_data method")
+
+        body_file_rows = [] 
+        
+        for body_data in layout_format_body:
+            if body_data["Repeat"] == False:
+                body_data_layout:str = body_data["Layout"]
+                for variable in body_data["Variables"]:
+                    function_name = variable["FunctionName"]
+
+                    if function_name == "GetPeriodStartDate":
+                        key_to_replace = f'{{{variable["FunctionName"]}}}'
+                        function_id = self.dataset + '`.' + function_name
+                        input_parameters = "('"+self.date_to_execute+"')" 
+
+                        period_date = self.__create_query_to_be_executed(function_id, input_parameters)
+                        logging.info(f'[PeriodDate] {period_date}')
+                        period_start_date = datetime.strptime(period_date, '%Y-%m-%d')
+                        body_data_layout = body_data_layout.replace(key_to_replace, period_start_date.strftime('%Y-%m-%d'))
+
+                body_file_rows.append(body_data_layout)
+            else:
+                for employee_data in output_view_data:
+                    formatted_row = self.__generate_row_format(employee_data, body_data["Layout"], body_data["Variables"])
+                    body_file_rows.append(formatted_row)
+       
+        return body_file_rows
+    
+    def __get_footer_data(self, footer:str, body_rows_count: int) -> str:
+        logging.info("__get_footer_data method")
+    
+        body_rows_count += 2 # It adds 2 because the header and the footer are not included in the body_rows_count
+
+        try:
+            return footer.replace("{TotalLineCount}", str(body_rows_count))
+        except AttributeError as e:
+            logging.error(traceback.format_exc())
+            raise AttributeError(f"Error replacing variable TotalLineCount in footer: {e}")
+
+    def __generate_row_format(self, employee_data, layout:str, variables:list) -> str:
+        for variable in variables:
+            try:
+                key_to_replace = f'{{{variable["ViewFieldName"]}}}'
+                value_to_replace = employee_data[variable["ViewFieldName"]]
+                layout = layout.replace(key_to_replace, value_to_replace or '')
+            except KeyError as e:
+                logging.error(traceback.format_exc())
+                raise KeyError(f"Error replacing variable {variable['ViewFieldName']}: {e}")
+        
+        return layout
+
+    def __get_data_from_output_view(self, full_path_view_name:str, order_by_column:str) -> dict:
+        logging.info("__get_data_from_output_view method")
+
+        query = f"SELECT * FROM {full_path_view_name}"
+        if order_by_column:
+            query += f" ORDER BY {order_by_column}"
+        query_results = self.__execute_query(query)
+
+        query_results_rows = query_results.total_rows
+        if query_results_rows > 0 :
+            return self.__convert_data_into_json(query_results)
+        else:
+            logging.warning(f"The view '{full_path_view_name}' does not have any rows to return")
+            return json.loads(r'{}')
+
+    def __get_adp_header_columns(self, function_to_be_invoked:str, country_key:str, environment: str, timestamp_file: str, month: str, filename:str) -> str:
+        logging.info("__get_adp_header_columns")
+
+        function_id = self.dataset + '`.' + function_to_be_invoked
+        input_parameters = "('"+self.region+"' ,'"+country_key+"' ,'"+self.data_source +"' ,'"+filename+"' ,'"+environment+"' ,'"+timestamp_file+"','"+month+"')" 
+        
+        return self.__create_query_to_be_executed(function_id, input_parameters)
+
+    def __get_environment(self) -> str:
+        logging.info("__get_environment method")
+        
+        function_id = self.dataset + '`.' + "GetEnvironmentType"
+        input_parameters = "('"+self.environment+"')"
+
+        return self.__create_query_to_be_executed(function_id, input_parameters)
+        
+    def __get_month(self) -> str:
+        logging.info("__get_month method")
+        
+        try:
+            month = datetime.strptime(self.date_to_execute,"%Y-%m-%d").month
+            return str('%02d' % month)
+        except ValueError as e:
+            logging.error(traceback.format_exc())
+            raise ValueError(f"Invalid date format for date_to_execute: {self.date_to_execute} - {e}")
+
+    def __get_countryKey(self) -> str:
+        logging.info("__get_countryKey method")
+
+        function_id = self.dataset + '`.' + "GetValidCountryKey"
+        input_parameters = "('"+self.country+"')"
+        
+        return self.__create_query_to_be_executed(function_id, input_parameters)
+
+    def __get_layout_format(self, layout_path:str) -> json:
+        logging.info("__get_layout_format method")
+
+        layout_path = layout_path.strip()
+        path = "../../../dag_06_files/dml/" + layout_path
+
+        layout_path = Path(__file__).parent / path
+        
+        try:
+            with open(layout_path, 'r') as layoutFile:
+                layout_data = json.load(layoutFile)
+        except FileNotFoundError as e:
+            logging.error(traceback.format_exc())
+            raise FileNotFoundError(f"File not found: {e} - Path: {layout_path}")
+        except IOError as e:
+            logging.error(traceback.format_exc())
+            raise IOError(f"Error reading file: {e} - Path: {layout_path}")
+        except ValueError as e:
+            logging.error(traceback.format_exc())
+            raise ValueError(f"Error while decoding JSON file: {e} - Path: {layout_path}")
+
+        return layout_data
+
+    def __get_file_name(self, output_file_name:str, file_name_function:str, country_key:str, environment:str, timestamp_file:str, month:str, filename:str, output_file_extension:str) -> str:
+        logging.info("__get_file_name method")
+        
+        file_name = ''
+
+        if(output_file_name.upper() == "CalculatedFileName".upper()):
+            file_name = self.__retrieve_file_name(file_name_function, country_key, environment, timestamp_file, month, filename)
+        else:
+            file_name = output_file_name.strip()
+            file_name = file_name + '_' + timestamp_file + output_file_extension 
+
+        return file_name
+
+    def __retrieve_file_name(self, file_name_function:str, country_key:str, environment:str, timestamp_file:str, month:str, filename:str) -> str:
+        logging.info("__retrieve_file_name method")
+
+        function_id = self.dataset + '`.' + file_name_function
+        input_parameters = "('"+self.region+"','"+country_key+"' ,'"+self.data_source+"','"+filename+"','"+environment+"','"+timestamp_file+"', '"+month+"' )" 
+
+        return self.__create_query_to_be_executed(function_id, input_parameters)
+
+    def __convert_data_into_json(self, query_results:bigquery.table.RowIterator) -> dict:
+        logging.info("__convert_data_into_json method")
+
+        rows_list = []
+
+        for row in query_results:
+            row_dict = dict(row.items())
+            rows_list.append(row_dict)
+
+        json_data = json.dumps(rows_list, indent=2)
+
+        return json.loads(json_data)
+
+    def __create_query_to_be_executed(self, function_id: str, input_parameters: str) -> str:
+        logging.info("__create_query_to_be_executed method")
+
+        query = 'Select `' + function_id  + input_parameters + ' as Result'
+        query_results = str(list(self.__execute_query(query))[0]["Result"])
+
+        return query_results
+    
+    def __execute_query(self, query:str) -> bigquery.table.RowIterator:
+        logging.info("__execute_query method")
+        logging.info(f'[Query to be executed]\n{query}')
+        try:
+            query_job = self.bq_client.query(query)
+            return query_job.result()
+        
+        except Exception:
+            logging.error("Failed to execute query", exc_info=True)
+            exit()
+
+    def __upload_file_to_bucket(self, bucket_name:str, destination_path:str, file_content:str) -> None:
+        logging.info("__upload_file_to_bucket method")
+
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            blob = bucket.blob(destination_path)
+            blob.upload_from_string(file_content, content_type="application/octet-stream")
+        except (NotFound, Forbidden, BadRequest) as e:
+            logging.error(f"Client error: {e}", exc_info=True)
+            raise Exception(f"Client error: {e}")
+        except (GoogleAPIError, DefaultCredentialsError) as e:
+            logging.error(f"Google API error: {e}", exc_info=True)
+            raise Exception(f"Google API error: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}", exc_info=True)
+            raise Exception(f"Unexpected error: {e}")
+
+        return None
+   
+    def __read_file_from_gcs(self, bucket_name:str, source_path:str) -> str:
+        logging.info("__read_file_from_gcs method")
+
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            blob = bucket.blob(source_path)
+            file_content = blob.download_as_string()
+        except Exception as e:
+            logging.error(traceback.format_exc())
+            raise Exception(f"Error reading file from bucket: {e}")
+
+        return file_content.decode("utf-8")
+    
+    def __execute_data_patrol_send(self, dp_dict):
+        logging.info("__execute_data_patrol_send method")
+
+        initial=1.0  # Initial delay in seconds
+        maximum=60.0  # Maximum delay in seconds
+        multiplier=2.0  # Multiplier for exponential backoff
+        max_retries=6
+
+        patterns = [
+            re.compile(r"Resources exceeded during query execution: Too many DML statements outstanding against table"),
+            re.compile(r"Exceeded rate limits: too many table update operations for this table"),
+            re.compile(r"Could not serialize access to table .* due to concurrent update")
+        ]
+
+        for attempt in range(max_retries):
+            logging.info(f"Attempt {attempt + 1} of {max_retries}")
+            try:
+                if dp_dict["component"] != "":
+                    log_path = f'{dp_dict["vendor"]}/{dp_dict["region"]}/{dp_dict["data_source"]}/{dp_dict["component"]}/{dp_dict["country_key"].lower()}/logs/'
+                else:
+                    log_path = f'{dp_dict["vendor"]}/{dp_dict["region"]}/{dp_dict["data_source"]}/{dp_dict["country_key"].lower()}/logs/'        
+                threshold_status, dp_threshold_override_flag = data_patrol_send(
+                    project_config      = dp_dict["project_config"],
+                    task_id             = dp_dict["task_id"],
+                    country             = dp_dict["country_key"],
+                    data_source         = dp_dict["data_source"],
+                    source_object       = dp_dict["source_object"],
+                    source_path         = dp_dict["source_path"],
+                    destination_object  = dp_dict["destination_object"],
+                    destination_path    = dp_dict["destination_path"],
+                    log_path            = log_path,
+                    log_object          = 'Log',
+                    component           = dp_dict["component"],
+                    views               = dp_dict["output_view_name"],
+                    global_approach     = True,
+                    doc_format          = dp_dict["doc_format"].replace(".", ""),
+                    timestamp           = dp_dict["timestamp"]
+                )
+                break
+            except (BadRequest, Forbidden) as e:
+                error_message = str(e)
+                if any(pattern.search(error_message) for pattern in patterns):
+                    
+                    logging.error(f"Attempt {attempt + 1} failed with error: {e}")
+                    if attempt < max_retries - 1:
+                        sleep_time = initial * (multiplier ** attempt)
+                        sleep_time = min(sleep_time, maximum)
+                        logging.info(f"Retrying in {sleep_time} seconds...")
+                        time.sleep(sleep_time)
+                    else:
+                        logging.error("Max retries reached. Failing the operation.")
+                        raise
+                else:
+                    logging.error(traceback.format_exc())
+                    raise
+
+        logging.info(f"Data patrol status: {threshold_status}")
+
+        return threshold_status, dp_threshold_override_flag
+    
+    def __copy_file_to_another_folder(self, bucket_name:str, source_blob_name:str, destination_blob_name:str, delete_source:bool = False) -> None:
+        logging.info("__copy_file_to_another_folder method")
+
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            source_blob = bucket.blob(source_blob_name)
+
+            bucket.copy_blob(source_blob, bucket, destination_blob_name)
+            logging.info(f"File {source_blob_name} copied to {destination_blob_name} successfully")
+
+            if delete_source:    
+                source_blob.delete()
+                logging.info(f"Source file {source_blob_name} deleted successfully")
+        except (NotFound, Forbidden, BadRequest) as e:
+            logging.error(f"Client error: {e}", exc_info=True)
+            raise Exception(f"Client error: {e}")
+        except (GoogleAPIError, DefaultCredentialsError) as e:
+            logging.error(f"Google API error: {e}", exc_info=True)
+            raise Exception(f"Google API error: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}", exc_info=True)
+            raise Exception(f"Unexpected error: {e}")
+
+        return None
+    
+    def __rename_blob_with_sap_extension(self, bucket_name:str, blob_name:str) -> None:
+        logging.info("__rename_blob_with_sap_extension method")
+
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            new_blob_name = blob_name.split('.')[0] + '.SAP'
+            bucket.rename_blob(blob, new_blob_name)
+            logging.info(f"Blob {blob_name} renamed to {new_blob_name} successfully")
+        except (NotFound, Forbidden, BadRequest) as e:
+            logging.error(f"Client error: {e}", exc_info=True)
+            raise Exception(f"Client error: {e}")
+        except (GoogleAPIError, DefaultCredentialsError) as e:
+            logging.error(f"Google API error: {e}", exc_info=True)
+            raise Exception(f"Google API error: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}", exc_info=True)
+            raise Exception(f"Unexpected error: {e}")
+
+        return None
+        
