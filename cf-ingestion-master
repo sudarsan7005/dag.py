@@ -1,0 +1,92 @@
+import json
+import traceback
+
+
+from services import filemappingconstants
+from common.services import constants
+from common.services.logger import logger
+from services.mainservice import MainService
+from google.cloud import storage
+
+def main(request):        
+    """ 
+        File ingestion master function. 
+        This function will pick all files matching with pattern and combine with Topic name.
+       
+    Returns:
+        200 HTTP Code.
+    """
+
+    logger.info(f"Executing CF Ingestion Master")
+    
+    try:
+
+        request_json = request.get_json()
+        logger.info("request_json={}".format(request_json))
+        message = request_json["message"]
+        messageAttributes = message["attributes"]
+        req_region = messageAttributes["region"]
+        req_datasource = messageAttributes["datasource"]
+
+        logger.info("req_region: {}".format(req_region))
+        logger.info("req_datasource: {}".format(req_datasource))
+
+        # get the bucket object
+        bucket = storage.Client().bucket(constants.INGESTION_BUCKET)
+
+        # get the main service object
+        mainService = MainService()
+
+        if str(req_region).lower() == 'uki' and str(req_datasource).lower() == 'equity':
+            mainService.truncate_datasource_tables(req_region, req_datasource, True)
+
+        # get the matching files from the bucket
+        for mapping in filemappingconstants.FILE_TOPIC_MAPPING:
+           
+            if mapping['region'] == req_region and mapping['datasource'] == req_datasource:
+                file_names_list=[]
+
+                pattern_name=mapping['pattern']
+                topic_name=mapping['topic']
+                extension_name=mapping['extension']
+                pattern_filter=mapping['patternfilter']
+
+                logger.info("pattern_name: {}".format(pattern_name))
+                logger.info("topic_name: {}".format(topic_name))
+                logger.info("extension: {}".format(extension_name))
+                logger.info("pattern_filter: {}".format(pattern_filter))
+ 
+                if pattern_filter:
+                    blobs = bucket.list_blobs(delimiter="/", match_glob=pattern_filter)          
+                else:
+                    blobs=bucket.list_blobs(delimiter="/", prefix=pattern_name)
+
+                if isinstance(pattern_name, str):
+                    for blob in blobs:
+                        if blob.name.endswith(extension_name):
+                            file_names_list.append(blob.name)
+                else:
+                    for blob in blobs:
+                        for pattern in pattern_name:
+                            if pattern in blob.name and blob.name.endswith(extension_name):
+                                file_names_list.append(blob.name) 
+
+                if len(file_names_list) > 0:
+
+                    logger.info("file_count: {}".format(len(file_names_list)))
+                    logger.info("file_names_list: {}".format(file_names_list))
+
+                    mainService.publish_message(topic_name, file_names_list, constants.INGESTION_BUCKET, req_region)
+                else:
+
+                    logger.info("No files found for {pattern_name} and topic: {topic_name}".format(topic_name=topic_name, pattern_name=pattern_name))
+
+            else:
+                logger.info("This file pattern {} has been skipped as it either donot belong to the requested region or datasource".format(mapping['pattern']))
+
+    except Exception as err:
+        logger.error(f"Error in main function : {err}")
+
+    logger.info("Execution completed!")
+    
+    return f"OK"
